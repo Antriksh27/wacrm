@@ -145,7 +145,6 @@ export async function POST(request: Request) {
   const { data: inserted, error: messageError } = await db
     .from('messages')
     .insert({
-      account_id: config.account_id,
       conversation_id: resolved.conversationId,
       sender_type: senderType,
       sender_id: null,
