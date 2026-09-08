@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { sanitizePhoneForMeta } from '@/lib/whatsapp/phone-utils'
 import { createClient } from '@/lib/supabase/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import {
@@ -11,6 +12,22 @@ import {
   validateSendMessageParams,
   SendMessageError,
 } from '@/lib/whatsapp/send-message'
+
+
+const HUMAN_TAKEOVER_WEBHOOK = 'https://n8n-lxfa.srv1928952.hstgr.cloud/webhook/booking-human-takeover'
+
+async function notifyHumanTakeover(supabase: SendSupabase, accountId: string, conversationId: string) {
+  try {
+    const { data: conversation, error } = await supabase.from('conversations').select('contact:contacts(phone)').eq('id', conversationId).eq('account_id', accountId).single()
+    if (error || !conversation) { console.error('[booking-human-takeover] Failed to load conversation phone:', error?.message); return }
+    const contact = conversation.contact as unknown as { phone?: string } | { phone?: string }[] | null
+    const rawPhone = Array.isArray(contact) ? contact[0]?.phone : contact?.phone
+    const mobile = rawPhone ? sanitizePhoneForMeta(rawPhone) : ''
+    if (!mobile) { console.error('[booking-human-takeover] Conversation contact has no usable phone'); return }
+    const response = await fetch(HUMAN_TAKEOVER_WEBHOOK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mobile }), signal: AbortSignal.timeout(5000) })
+    if (!response.ok) console.error('[booking-human-takeover] Webhook returned', response.status, await response.text().catch(() => ''))
+  } catch (error) { console.error('[booking-human-takeover] Webhook failed:', error instanceof Error ? error.message : error) }
+}
 
 // The dashboard's outbound-send endpoint. It owns auth, per-user rate
 // limiting, and the two ways the UI targets a thread — an existing
@@ -166,6 +183,9 @@ export async function POST(request: Request) {
         interactivePayload: interactive_payload,
         replyToMessageId: reply_to_message_id,
       })
+
+      // Meta send and CRM persistence succeeded. Notify n8n best-effort so webhook failure never blocks the human message.
+      void notifyHumanTakeover(supabase, accountId, conversationId)
 
       return NextResponse.json({
         success: true,

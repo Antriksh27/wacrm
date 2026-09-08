@@ -112,6 +112,15 @@ export function AiThreadBanner({
           toast.error(j?.error ?? t("updateError"));
           return;
         }
+        if (!paused) {
+          const resumeRes = await fetch('/api/whatsapp/booking-resume/' + conversationId, { method: 'POST' });
+          if (!resumeRes.ok) {
+            const j = await resumeRes.json().catch(() => ({}));
+            toast.error(j?.error ?? 'Failed to resume booking bot');
+            return;
+          }
+        }
+
         setPaused(paused);
         onChange?.({
           ai_autoreply_disabled: paused,
