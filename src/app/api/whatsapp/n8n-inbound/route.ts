@@ -153,6 +153,45 @@ function extractValues(body: Record<string, unknown>): IncomingValue[] {
     return [body.value as IncomingValue]
   }
 
+  // n8n also sends its normalized flat payload (to, whatsapp_message_id,
+  // type/content_type, media_id, media_mime_type, etc.). Convert that shape
+  // back into the native Meta value shape so the same conversation, media
+  // mirroring, dedupe and timestamp logic is used for both ingress paths.
+  if (body.whatsapp_message_id || body.media_id || body.type || body.content_type) {
+    const type = typeof body.type === 'string' ? body.type : (typeof body.content_type === 'string' ? body.content_type : 'text')
+    const from = typeof body.to === 'string' ? body.to : (typeof body.wa_id === 'string' ? body.wa_id : '')
+    const id = typeof body.whatsapp_message_id === 'string'
+      ? body.whatsapp_message_id
+      : (typeof body.message_id === 'string' ? body.message_id : '')
+    const timestamp = body.incoming_timestamp ?? body.timestamp
+    const mimeType = typeof body.media_mime_type === 'string' ? body.media_mime_type : undefined
+    const caption = typeof body.media_caption === 'string' ? body.media_caption : undefined
+    const mediaId = typeof body.media_id === 'string' ? body.media_id : undefined
+    const contentText = typeof body.content_text === 'string'
+      ? body.content_text
+      : (typeof body.text === 'string' ? body.text : undefined)
+
+    const message: IncomingMessage = {
+      id,
+      from,
+      timestamp: typeof timestamp === 'string' || typeof timestamp === 'number' ? String(timestamp) : undefined,
+      type,
+      text: type === 'text' && contentText ? { body: contentText } : undefined,
+      image: type === 'image' && mediaId ? { id: mediaId, mime_type: mimeType, caption } : undefined,
+      video: type === 'video' && mediaId ? { id: mediaId, mime_type: mimeType, caption } : undefined,
+      document: type === 'document' && mediaId ? { id: mediaId, mime_type: mimeType, filename: typeof body.media_filename === 'string' ? body.media_filename : undefined, caption } : undefined,
+      audio: type === 'audio' && mediaId ? { id: mediaId, mime_type: mimeType } : undefined,
+    }
+
+    return [{
+      metadata: {
+        phone_number_id: typeof body.phone_number_id === 'string' ? body.phone_number_id : undefined,
+      },
+      contacts: from ? [{ wa_id: from }] : [],
+      messages: [message],
+    }]
+  }
+
   // Finally accept a direct value-shaped payload.
   return [body as unknown as IncomingValue]
 }
