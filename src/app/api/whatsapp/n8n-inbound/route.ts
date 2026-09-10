@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { resolveConversationByPhone } from '@/lib/whatsapp/resolve-conversation'
 import { reopenClosedConversation } from '@/lib/conversations/reopen'
+import { decrypt } from '@/lib/whatsapp/encryption'
+import { getMediaUrl } from '@/lib/whatsapp/meta-api'
+import { mirrorInboundMedia } from '@/lib/whatsapp/mirror-inbound-media'
 
 export const runtime = 'nodejs'
 
@@ -72,6 +75,57 @@ function mediaType(message: IncomingMessage): string | null {
   }
 }
 
+function mediaId(message: IncomingMessage): string | null {
+  switch (message.type) {
+    case 'image': return message.image?.id ?? null
+    case 'video': return message.video?.id ?? null
+    case 'document': return message.document?.id ?? null
+    case 'audio': return message.audio?.id ?? null
+    default: return null
+  }
+}
+
+function mediaFileName(message: IncomingMessage): string | null {
+  return message.type === 'document' ? message.document?.filename ?? null : null
+}
+
+async function resolveMediaUrl(
+  db: ReturnType<typeof admin>,
+  config: { account_id: string; access_token?: string | null; mirror_inbound_media?: boolean | null },
+  message: IncomingMessage,
+): Promise<string | null> {
+  const id = mediaId(message)
+  if (!id) return null
+
+  const fallback = `/api/whatsapp/media/${encodeURIComponent(id)}`
+
+  try {
+    if (!config.access_token) return fallback
+    const accessToken = decrypt(config.access_token)
+    const info = await getMediaUrl({ mediaId: id, accessToken })
+
+    if (config.mirror_inbound_media !== false) {
+      const mirrored = await mirrorInboundMedia({
+        storage: db.storage,
+        accountId: config.account_id,
+        mediaId: id,
+        downloadUrl: info.url,
+        accessToken,
+        mimeType: info.mimeType ?? mediaType(message),
+        fileSize: info.fileSize,
+        fileName: mediaFileName(message),
+        messageTimestamp: message.timestamp,
+      })
+      if (mirrored) return mirrored
+    }
+
+    return fallback
+  } catch (error) {
+    console.error(`[n8n-inbound] failed to resolve media ${id}:`, error instanceof Error ? error.message : error)
+    return fallback
+  }
+}
+
 function isAuthorized(request: Request): boolean {
   const expected = process.env.N8N_CRM_INBOUND_SECRET
   if (!expected) return false
@@ -125,7 +179,7 @@ export async function POST(request: Request) {
 
     const { data: configs, error: configError } = await db
       .from('whatsapp_config')
-      .select('account_id, user_id')
+      .select('account_id, user_id, access_token, mirror_inbound_media')
       .eq('phone_number_id', phoneNumberId)
 
     if (configError) {
@@ -166,7 +220,7 @@ export async function POST(request: Request) {
             sender_id: null,
             content_type: contentType(message.type),
             content_text: contentText(message),
-            media_url: null,
+            media_url: await resolveMediaUrl(db, config, message),
             message_id: message.id,
             media_type: mediaType(message),
             status: 'sent',
