@@ -25,6 +25,13 @@ type IncomingMessage = {
   document?: { id?: string; mime_type?: string; filename?: string; caption?: string }
   audio?: { id?: string; mime_type?: string }
   location?: { latitude?: number; longitude?: number; name?: string; address?: string }
+  interactive?: {
+    type?: 'button_reply' | 'list_reply'
+    button_reply?: { id?: string; title?: string }
+    list_reply?: { id?: string; title?: string; description?: string }
+  }
+  button?: { text?: string; payload?: string }
+  context?: { id?: string }
 }
 
 type IncomingValue = {
@@ -47,7 +54,10 @@ function contentType(type: string | undefined): string {
     case 'audio':
     case 'location':
     case 'text':
+    case 'interactive':
       return type
+    case 'button':
+      return 'interactive'
     default:
       return 'text'
   }
@@ -61,6 +71,24 @@ function contentText(message: IncomingMessage): string | null {
   if (message.location) {
     const name = message.location.name || message.location.address
     return name ? `[Location] ${name}` : '[Location]'
+  }
+  if (message.interactive) {
+    const reply = message.interactive.button_reply ?? message.interactive.list_reply
+    return reply?.title || reply?.id || '[Interactive reply]'
+  }
+  if (message.button) {
+    return message.button.text || message.button.payload || '[Button reply]'
+  }
+  return null
+}
+
+function interactiveReplyId(message: IncomingMessage): string | null {
+  if (message.interactive) {
+    const reply = message.interactive.button_reply ?? message.interactive.list_reply
+    return reply?.id || reply?.title || null
+  }
+  if (message.button) {
+    return message.button.payload || message.button.text || null
   }
   return null
 }
@@ -211,10 +239,15 @@ export async function POST(request: Request) {
   const db = admin()
   const values = extractValues(body)
   let processed = 0
+  let duplicates = 0
+  let skipped = 0
 
   for (const value of values) {
     const phoneNumberId = value.metadata?.phone_number_id
-    if (!phoneNumberId || !value.messages?.length) continue
+    if (!phoneNumberId || !value.messages?.length) {
+      skipped += 1
+      continue
+    }
 
     const { data: configs, error: configError } = await db
       .from('whatsapp_config')
@@ -234,7 +267,10 @@ export async function POST(request: Request) {
     const config = configs[0]
 
     for (const message of value.messages) {
-      if (!message.id || !message.from) continue
+      if (!message.id || !message.from) {
+        skipped += 1
+        continue
+      }
 
       const contactInfo = value.contacts?.find((c) => c.wa_id === message.from) ?? value.contacts?.[0]
       const phone = normalizePhone(message.from)
@@ -261,6 +297,7 @@ export async function POST(request: Request) {
             content_text: contentText(message),
             media_url: await resolveMediaUrl(db, config, message),
             message_id: message.id,
+            interactive_reply_id: interactiveReplyId(message),
             media_type: mediaType(message),
             status: 'sent',
             created_at: createdAt,
@@ -306,9 +343,22 @@ export async function POST(request: Request) {
         }
 
         processed += 1
+      } else {
+        duplicates += 1
       }
     }
   }
 
-  return NextResponse.json({ status: 'received', processed }, { status: 200 })
+  if (processed > 0) {
+    return NextResponse.json({ status: 'processed', processed, duplicates, skipped }, { status: 200 })
+  }
+
+  if (duplicates > 0 && skipped === 0) {
+    return NextResponse.json({ status: 'duplicate', processed: 0, duplicates, skipped: 0 }, { status: 200 })
+  }
+
+  return NextResponse.json(
+    { error: 'No valid inbound WhatsApp messages were processed', processed: 0, duplicates, skipped },
+    { status: 400 },
+  )
 }
