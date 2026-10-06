@@ -34,11 +34,19 @@ type IncomingMessage = {
   context?: { id?: string }
 }
 
+type IncomingStatus = {
+  id?: string
+  status?: string
+  timestamp?: string
+  recipient_id?: string
+}
+
 type IncomingValue = {
   messaging_product?: string
   metadata?: { phone_number_id?: string; display_phone_number?: string }
   contacts?: Array<{ wa_id?: string; profile?: { name?: string } }>
   messages?: IncomingMessage[]
+  statuses?: IncomingStatus[]
 }
 
 function normalizePhone(phone: string): string {
@@ -224,6 +232,77 @@ function extractValues(body: Record<string, unknown>): IncomingValue[] {
   return [body as unknown as IncomingValue]
 }
 
+const RECIPIENT_STATUS_LADDER = ['pending', 'sent', 'delivered', 'read', 'replied'] as const
+
+function ladderLevel(status: string): number {
+  const index = RECIPIENT_STATUS_LADDER.indexOf(status as typeof RECIPIENT_STATUS_LADDER[number])
+  return index < 0 ? -1 : index
+}
+
+function isValidStatusTransition(current: string, incoming: string): boolean {
+  if (incoming === 'failed') return current === 'pending' || current === 'sent'
+  if (current === 'failed') return false
+  const currentLevel = ladderLevel(current)
+  const incomingLevel = ladderLevel(incoming)
+  if (incomingLevel < 0) return false
+  if (currentLevel < 0) return true
+  return incomingLevel > currentLevel
+}
+
+async function processStatusUpdate(
+  db: ReturnType<typeof admin>,
+  status: IncomingStatus,
+): Promise<'processed' | 'ignored' | 'skipped'> {
+  if (!status.id || !status.status) return 'skipped'
+
+  // Keep message-level delivery state synchronized, matching the original
+  // Meta webhook behavior. message_id is intentionally not assumed unique.
+  const { error: messageError } = await db
+    .from('messages')
+    .update({ status: status.status })
+    .eq('message_id', status.id)
+
+  if (messageError) {
+    console.error('[n8n-inbound] message status update failed:', messageError)
+    throw new Error('Failed to update message status')
+  }
+
+  const { data: recipient, error: recipientFetchError } = await db
+    .from('broadcast_recipients')
+    .select('id, status')
+    .eq('whatsapp_message_id', status.id)
+    .maybeSingle()
+
+  if (recipientFetchError) {
+    console.error('[n8n-inbound] broadcast recipient lookup failed:', recipientFetchError)
+    throw new Error('Failed to update broadcast recipient status')
+  }
+
+  if (!recipient) return 'skipped'
+  if (!isValidStatusTransition(recipient.status, status.status)) return 'ignored'
+
+  const timestamp = status.timestamp
+    ? new Date(Number(status.timestamp) * 1000).toISOString()
+    : new Date().toISOString()
+
+  const update: Record<string, unknown> = { status: status.status }
+  if (status.status === 'sent') update.sent_at = timestamp
+  if (status.status === 'delivered') update.delivered_at = timestamp
+  if (status.status === 'read') update.read_at = timestamp
+
+  const { error: recipientUpdateError } = await db
+    .from('broadcast_recipients')
+    .update(update)
+    .eq('id', recipient.id)
+
+  if (recipientUpdateError) {
+    console.error('[n8n-inbound] broadcast recipient status update failed:', recipientUpdateError)
+    throw new Error('Failed to update broadcast recipient status')
+  }
+
+  return 'processed'
+}
+
 export async function POST(request: Request) {
   if (!isAuthorized(request)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
@@ -241,11 +320,34 @@ export async function POST(request: Request) {
   let processed = 0
   let duplicates = 0
   let skipped = 0
+  let statusProcessed = 0
+  let statusIgnored = 0
+  let statusSkipped = 0
 
   for (const value of values) {
     const phoneNumberId = value.metadata?.phone_number_id
+
+    // n8n forwards Meta delivery/read events through this same endpoint.
+    // Process them independently of inbound messages so a status-only
+    // webhook is not discarded by the message guard below.
+    if (value.statuses?.length) {
+      for (const status of value.statuses) {
+        try {
+          const result = await processStatusUpdate(db, status)
+          if (result === 'processed') statusProcessed += 1
+          else if (result === 'ignored') statusIgnored += 1
+          else statusSkipped += 1
+        } catch {
+          return NextResponse.json(
+            { error: 'Failed to process WhatsApp status update', status_processed: statusProcessed },
+            { status: 500 },
+          )
+        }
+      }
+    }
+
     if (!phoneNumberId || !value.messages?.length) {
-      skipped += 1
+      if (!value.statuses?.length) skipped += 1
       continue
     }
 
@@ -349,16 +451,34 @@ export async function POST(request: Request) {
     }
   }
 
-  if (processed > 0) {
-    return NextResponse.json({ status: 'processed', processed, duplicates, skipped }, { status: 200 })
+  if (processed > 0 || statusProcessed > 0 || statusIgnored > 0) {
+    return NextResponse.json(
+      {
+        status: processed > 0 ? 'processed' : 'status_processed',
+        processed,
+        duplicates,
+        skipped,
+        status_processed: statusProcessed,
+        status_ignored: statusIgnored,
+        status_skipped: statusSkipped,
+      },
+      { status: 200 },
+    )
   }
 
-  if (duplicates > 0 && skipped === 0) {
-    return NextResponse.json({ status: 'duplicate', processed: 0, duplicates, skipped: 0 }, { status: 200 })
+  if (duplicates > 0 && skipped === 0 && statusSkipped === 0) {
+    return NextResponse.json({ status: 'duplicate', processed: 0, duplicates, skipped: 0, status_processed: 0 }, { status: 200 })
+  }
+
+  if (statusSkipped > 0 && processed === 0 && duplicates === 0 && skipped === 0) {
+    return NextResponse.json(
+      { status: 'status_skipped', processed: 0, status_processed: 0, status_skipped: statusSkipped },
+      { status: 200 },
+    )
   }
 
   return NextResponse.json(
-    { error: 'No valid inbound WhatsApp messages were processed', processed: 0, duplicates, skipped },
+    { error: 'No valid inbound WhatsApp messages were processed', processed: 0, duplicates, skipped, status_processed: 0, status_skipped: statusSkipped },
     { status: 400 },
   )
 }
